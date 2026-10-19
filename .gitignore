@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行产物
+proxy.log
+_cont.log
+_pt.log
+*.bak.py
+
+# 凭证（绝不该进仓库，双保险）
+auth.toml
+.atomcode/
+atomcode-home/
+.env
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
