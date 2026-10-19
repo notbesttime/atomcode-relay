@@ -99,10 +99,143 @@ MASKED_ERRORS = ("请求负载过高", "参数错误", "模型不存在", "rate 
                  "不支持的平台或代理配置缺失",
                  # AI Hub 月度额度打满时上游也拿 200 + 这句话当正文返回
                  # （2026-10-18 实测：B 池返回「每月token额度已不足」）
-                 "额度已不足", "额度不足")
+                 "额度已不足", "额度不足",
+                  # 2026-10-19 实测新增：A 池按模型的配额打满时上游同样拿 200 +
+                  # 这句话当正文 —— 而 status-v2 的 5h 窗口计数器此刻仍是
+                  # 0/200、exhausted=false，说明窗口之外还有一道按模型的闸。
+                  "用量窗口内已达上限", "窗口内已达上限")
 
 HOP = {"host", "connection", "content-length", "transfer-encoding", "authorization",
        "x-api-key", "accept-encoding", "keep-alive", "proxy-authorization"}
+
+
+# ------------------------------------------------------------------ 调用台账
+class Metrics:
+    """每次调用记一行 JSONL（stats.jsonl），并留内存索引给网页控制台。
+
+    记录字段：时间/模型/协议/状态/总耗时/首字耗时/token(prompt,completion,
+    reasoning,cached)/续写轮数。缓存命中来自上游 usage 的
+    prompt_tokens_details.cached_tokens（实测存在：重复前缀命中 320/372）。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.calls = []
+        self.lock = threading.Lock()
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    for ln in fh:
+                        try:
+                            self.calls.append(json.loads(ln))
+                        except Exception:
+                            pass
+                if len(self.calls) > 20000:
+                    self.calls = self.calls[-20000:]
+        except Exception:
+            self.calls = []
+
+    def record(self, rec):
+        with self.lock:
+            self.calls.append(rec)
+            if len(self.calls) > 20000:
+                self.calls = self.calls[-10000:]
+            try:
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _sum(rows):
+        s = {"calls": 0, "ok": 0, "prompt": 0, "completion": 0, "total": 0,
+             "reasoning": 0, "cached": 0, "cache_calls": 0, "tok_s_sum": 0.0,
+             "tok_s_n": 0}
+        for r in rows:
+            s["calls"] += 1
+            if r.get("status") == 200:
+                s["ok"] += 1
+            for k in ("prompt", "completion", "total", "reasoning", "cached"):
+                s[k] += int(r.get(k) or 0)
+            if int(r.get("cached") or 0) > 0:
+                s["cache_calls"] += 1
+            if r.get("tok_s"):
+                s["tok_s_sum"] += float(r["tok_s"])
+                s["tok_s_n"] += 1
+        s["tok_s_avg"] = round(s["tok_s_sum"] / s["tok_s_n"], 1) if s["tok_s_n"] else None
+        return s
+
+    def stats(self, days, frm=None, to=None):
+        now = time.time()
+        rows = []
+        for r in self.calls:
+            t = r.get("t", 0)
+            if frm is not None:
+                if frm <= t < to:
+                    rows.append(r)
+            elif now - t <= days * 86400:
+                rows.append(r)
+        return self._sum(rows)
+
+    def recent(self, n):
+        with self.lock:
+            return list(self.calls[-n:])
+
+
+def _usage_extract(obj):
+    """从 chat 完成体 / usage 字典里抠出统一字段。"""
+    u = obj.get("usage") if isinstance(obj, dict) else None
+    if not isinstance(u, dict):
+        u = obj if isinstance(obj, dict) else {}
+    if not (u.get("prompt_tokens") or u.get("completion_tokens")):
+        return None
+    ptl = u.get("prompt_tokens_details") or {}
+    ctd = u.get("completion_tokens_details") or {}
+    return {"prompt": int(u.get("prompt_tokens") or 0),
+            "completion": int(u.get("completion_tokens") or 0),
+            "total": int(u.get("total_tokens") or 0),
+            "reasoning": int(ctd.get("reasoning_tokens") or 0),
+            "cached": int(ptl.get("cached_tokens") or 0)}
+
+
+def _usage_from_raw(raw):
+    try:
+        return _usage_extract(json.loads(raw.decode("utf-8", "replace")))
+    except Exception:
+        return None
+
+
+def _usage_from_lines(lines):
+    """扫描一批 SSE 行，返回 (usage, 正文字符数)。usage 取最后出现的。
+    兼容 chat chunk 与 responses 事件（output_text.delta）两种格式。"""
+    usage, out_chars = None, 0
+    for ln in lines:
+        try:
+            s = ln.decode("utf-8", "replace") if isinstance(ln, bytes) else ln
+        except Exception:
+            continue
+        t = s.strip()
+        if not t.startswith("data:"):
+            continue
+        p = t[5:].strip()
+        if not p or p == "[DONE]":
+            continue
+        try:
+            ev = json.loads(p)
+        except Exception:
+            continue
+        if ev.get("type") == "response.output_text.delta":
+            out_chars += len(ev.get("delta") or "")
+        for ch in ev.get("choices") or []:
+            d = ch.get("delta") or {}
+            c = d.get("content") or ch.get("message", {}).get("content")
+            if isinstance(c, str):
+                out_chars += len(c)
+        if ev.get("usage"):
+            u = _usage_extract(ev)
+            if u:
+                usage = u
+    return usage, out_chars
 
 
 # ------------------------------------------------------------------ auth.toml
@@ -538,6 +671,33 @@ class Proxy(BaseHTTPRequestHandler):
     token_floor = TOKEN_FLOOR
     drop_max = DROP_MAX_TOKENS
     _client_gone = False
+    metrics = None          # main() 里挂 Metrics 实例
+
+    def _tally(self, ctx, status, usage=None, chars=0, continues=0):
+        """记一笔调用台账。ctx={t0,t1,fb,model,proto}；绝不抛错影响主流程。"""
+        try:
+            if self.metrics is None or not ctx:
+                return
+            now = time.time()
+            dur = round(max(ctx.get("t1") or now, ctx.get("t0", now)) - ctx.get("t0", now), 2)
+            u = usage or {}
+            comp = int(u.get("completion") or 0)
+            est = int(chars / 1.8) if not comp and chars else 0
+            tok_s = None
+            secs = max(dur - (max(0.0, (ctx.get("fb") or ctx.get("t0", now)) - ctx.get("t0", now))), 0.1) if ctx.get("fb") else max(dur, 0.1)
+            n = comp or est
+            if n and dur > 0:
+                tok_s = round(n / secs, 1)
+            self.metrics.record({
+                "t": round(ctx.get("t0", now), 2), "model": ctx.get("model"),
+                "proto": ctx.get("proto"), "status": status, "dur": dur,
+                "ttft": round((ctx["fb"] - ctx["t0"]), 2) if ctx.get("fb") else None,
+                "prompt": u.get("prompt", 0), "completion": comp,
+                "total": u.get("total", 0), "reasoning": u.get("reasoning", 0),
+                "cached": u.get("cached", 0), "est_out": est,
+                "cont": continues, "tok_s": tok_s})
+        except Exception:
+            pass
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[proxy] %s - %s\n" % (self.address_string(), fmt % args))
@@ -556,9 +716,9 @@ class Proxy(BaseHTTPRequestHandler):
             left -= len(chunk)
         return bytes(buf)
 
-    def _send_json(self, status, payload):
+    def _send_json(self, status, payload, ctype="application/json"):
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -601,13 +761,27 @@ class Proxy(BaseHTTPRequestHandler):
         elif method == "POST" and sub.endswith("/messages"):
             # Anthropic 协议 max_tokens 必填：只能抬，不能删
             body = _scrub_budget(body, self.token_floor, False)
+        # 台账上下文
+        ctx = {"t0": time.time(), "model": None,
+               "proto": ("anthropic" if sub.endswith("/messages")
+                         else "chat"), "fb": None, "t1": None}
+        try:
+            if body:
+                ctx["model"] = json.loads(body.decode("utf-8", "replace")).get("model")
+        except Exception:
+            pass
         try:
             resp = self._open(method, path, body, stream)
         except urllib.error.HTTPError as exc:
-            self._send_json(exc.code, exc.read())
+            payload = exc.read()
+            self._send_json(exc.code, payload)
+            ctx["t1"] = time.time()
+            self._tally(ctx, exc.code)
             return
         except Exception as exc:
             self.send_error(502, "upstream: %s" % exc)
+            ctx["t1"] = time.time()
+            self._tally(ctx, 502)
             return
 
         status = getattr(resp, "status", 200)
@@ -625,11 +799,16 @@ class Proxy(BaseHTTPRequestHandler):
                         raise RuntimeError("reopen not a stream: %s" % raw[:80])
                     return r
 
-                self._passthrough_sse(resp, reopen)
+                lines = self._passthrough_sse(resp, reopen, ctx)
+                usage, chars = _usage_from_lines(lines)
+                ctx["t1"] = time.time()
+                self._tally(ctx, ctx.get("status", 200), usage, chars)
                 return
             raw = resp.read()
+            ctx["t1"] = time.time()
             if status == 200 and _masked_error(raw):
                 self._send_json(503, raw)   # 上游拿 200 伪装的失败
+                self._tally(ctx, 503)
                 return
             self.send_response(status)
             if ctype:
@@ -637,14 +816,17 @@ class Proxy(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+            usage = _usage_from_raw(raw) if status == 200 else None
+            self._tally(ctx, status, usage)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass  # 客户端主动断流
         finally:
             # 同步 close() 会和阻塞在 readline() 的线程抢同一把锁 -> 主线程钉死
             threading.Thread(target=_quiet_close, args=(resp,), daemon=True).start()
 
-    def _passthrough_sse(self, resp, reopen=None):
-        """逐行转发上游 SSE；带「死流透明重开」与「补发 [DONE]」。
+    def _passthrough_sse(self, resp, reopen=None, ctx=None):
+        """逐行转发上游 SSE；带「死流透明重开」与「补发 [DONE]」。返回转过的
+        数据行（给台账统计 usage/输出量）。
 
         三条规矩都来自官方 provider 实现（atomcode-capabilities）：
           1. retry.rs:5   "Metadata alone is replay-safe"
@@ -662,11 +844,12 @@ class Proxy(BaseHTTPRequestHandler):
         BufferedReader，中途超时会让缓冲区留下半行状态，重开时读到垃圾。
         """
         attempt = 0
+        seen_lines = []
         while True:
             attempt += 1
-            opened, eof, saw_finish = self._pump_sse_once(resp, attempt)
+            opened, eof, saw_finish = self._pump_sse_once(resp, attempt, ctx, seen_lines)
             if eof in ("client", "ok"):
-                return
+                return seen_lines
             if (eof == "dead" and not opened and reopen
                     and attempt < MAX_STREAM_ATTEMPTS):
                 sys.stderr.write("[reopen] 第 %d 次：上游在首个可见事件前静默，重发整个请求\n"
@@ -687,7 +870,7 @@ class Proxy(BaseHTTPRequestHandler):
                     "message": "上游在首个事件前静默 %.0fs（已试 %d 次）"
                                % (FIRST_EVENT_S, attempt),
                     "type": "upstream_stalled"}}).encode())
-                return
+                return seen_lines
             if eof == "dead" and opened and saw_finish:
                 # 规矩 3 的另一半：已 finish_reason 但流死了 -> 补信标收尾
                 self._chunk(b"data: [DONE]\n\n")
@@ -696,7 +879,7 @@ class Proxy(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 except Exception:
                     pass
-                return
+                return seen_lines
             if eof == "dead" and opened:
                 # 最危险的一格：流已经开、又没有 finish_reason，重发不安全。
                 # 但**必须关闭 chunked 传输**，否则客户端会永远等下去
@@ -708,13 +891,14 @@ class Proxy(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 except Exception:
                     pass
-                return
-            return
+                return seen_lines
+            return seen_lines
 
-    def _pump_sse_once(self, resp, attempt):
+    def _pump_sse_once(self, resp, attempt, ctx=None, seen=None):
         """转发一段上游流。返回 (是否已开流, 结束原因, 是否见过 finish_reason)。
 
         结束原因: "ok" 正常收尾 | "dead" 静默或读失败 | "client" 客户端断开
+        转过的数据行 append 进 seen（台账统计用）；首个可见内容时刻写 ctx["fb"]。
         """
         q = queue.Queue()
         stop = threading.Event()
@@ -758,6 +942,12 @@ class Proxy(BaseHTTPRequestHandler):
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             opened = True
+            if ctx is not None and ctx.get("fb") is None:
+                ctx["fb"] = time.time()   # 首字节（= 首个可见内容）时刻
+
+        def note(data_line):
+            if seen is not None:
+                seen.append(data_line)
 
         # 没开流 => 给"首个可见事件"较短预算（超了就能安全重开）
         # 已开流 => 用 STALL_S，此时重发不安全，只能收尾
@@ -785,6 +975,7 @@ class Proxy(BaseHTTPRequestHandler):
                 if not self._chunk(line):
                     stop.set()
                     return True, "client", saw_finish
+                note(line)
                 # 复读熔断（已开流阶段）：转发的同时盯内容。命中 => 切断并
                 # 关 chunked 传输（不伪造 finish/[DONE]，与挂死收尾同一规矩）。
                 st0 = line.strip()
@@ -811,6 +1002,7 @@ class Proxy(BaseHTTPRequestHandler):
                 if not self._chunk(buf):
                     stop.set()
                     return True, "client", saw_finish
+                note(buf)
                 buf = b""
                 continue
             st = line.strip()
@@ -822,6 +1014,7 @@ class Proxy(BaseHTTPRequestHandler):
                 saw_done = True
                 open_stream()
                 self._chunk(buf)
+                note(buf)
                 buf = b""
                 break
             try:
@@ -850,6 +1043,7 @@ class Proxy(BaseHTTPRequestHandler):
                 if not self._chunk(buf):
                     stop.set()
                     return True, "client", saw_finish
+                note(buf)
                 buf = b""
                 # 这个事件本身也要进熔断窗口（后续行走 verdict is False 分支）
                 if feed_guard(ev):
@@ -866,11 +1060,14 @@ class Proxy(BaseHTTPRequestHandler):
         if isinstance(verdict, bytes):
             # 上游拿 200 伪装的失败：尚未开流时可以直接改状态码
             self._send_json(503, verdict)
+            if ctx is not None:
+                ctx["status"] = 503
             return opened, "ok", saw_finish
 
         open_stream()
         if buf:
             self._chunk(buf)
+            note(buf)
         # 规矩 3：上游关了连接却没发 [DONE]，但已经 finish_reason
         #         => 补一个 [DONE]，让客户端把这轮当正常结束。
         if not saw_done and saw_finish:
@@ -940,19 +1137,29 @@ class Proxy(BaseHTTPRequestHandler):
         want_stream = bool(chat["stream"])
         resp_id = "resp_" + os.urandom(16).hex()
         payload = json.dumps(chat, separators=(",", ":")).encode()
+        ctx = {"t0": time.time(), "model": chat.get("model"), "proto": "responses",
+               "fb": None, "t1": None}
         try:
             up = self._open("POST", "/chat/completions", payload, want_stream)
         except urllib.error.HTTPError as exc:
             self._send_json(exc.code, exc.read())
+            ctx["t1"] = time.time()
+            self._tally(ctx, exc.code)
             return
         except Exception as exc:
             self.send_error(502, "upstream: %s" % exc)
+            ctx["t1"] = time.time()
+            self._tally(ctx, 502)
             return
         try:
             if want_stream:
-                self._responses_stream(up, chat.get("model"), resp_id, chat)
+                self._responses_stream(up, chat.get("model"), resp_id, chat, ctx)
             else:
-                self._responses_plain(up.read(), chat.get("model"), resp_id)
+                raw = up.read()
+                ctx["t1"] = time.time()
+                self._responses_plain(raw, chat.get("model"), resp_id)
+                self._tally(ctx, 503 if _masked_error(raw) else 200,
+                            _usage_from_raw(raw))
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
@@ -996,11 +1203,14 @@ class Proxy(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _responses_stream(self, up, model, resp_id, chat=None):
+    def _responses_stream(self, up, model, resp_id, chat=None, ctx=None):
         gen = self._upstream_events(up)
         first = next(gen, None)
         if first is not None and _chat_event_is_error(first):
             self._send_json(503, json.dumps(first).encode())
+            if ctx is not None:
+                ctx["t1"] = time.time()
+                self._tally(ctx, 503)
             return
 
         def chained():
@@ -1041,12 +1251,18 @@ class Proxy(BaseHTTPRequestHandler):
         out_q = queue.Queue()     # 已转换好的 Responses 事件
         stop = threading.Event()
         last_real = [time.time()]  # 最后一个**真实**上游事件的时刻
+        usage_box = [None]         # 上游 chat 事件里的 usage（feed 线程顺手抠）
+        cont_box = [0]             # 已发生的自动续写轮数（台账用）
 
         def feed():
             try:
                 for ev in chained():
                     if stop.is_set():
                         return
+                    if ev.get("usage"):
+                        u = _usage_extract(ev)
+                        if u:
+                            usage_box[0] = u
                     up_q.put(ev)
             except Exception as exc:
                 up_q.put(exc)
@@ -1221,6 +1437,7 @@ class Proxy(BaseHTTPRequestHandler):
                       "looped": False, "truncated": False}
                 stop.set()   # 停掉原桥接线程，之后由续写直接写
                 for i in range(1, MAX_CONTINUES + 1):
+                    cont_box[0] = i
                     sys.stderr.write("[cont] 第 %d/%d 次自动续写（已保留 %d 字）\n"
                                      % (i, MAX_CONTINUES, len("".join(text_buf))))
                     sys.stderr.flush()
@@ -1303,6 +1520,16 @@ class Proxy(BaseHTTPRequestHandler):
             pass
         finally:
             stop.set()
+            if ctx is not None:
+                # 台账：status 用"是否发出终止事件"区分 200/499(客户端断)；
+                # usage 优先上游回传，缺失时按正文字符估算输出量。
+                u = usage_box[0]
+                chars = len("".join(text_buf))
+                if u is None and chars:
+                    u = {"prompt": 0, "completion": 0, "total": 0,
+                         "reasoning": 0, "cached": 0}
+                self._tally(ctx, 200 if saw_terminal else 499, u, chars,
+                            continues=cont_box[0])
 
 
     def _continue_stream(self, chat, model, resp_id, n, st, up_prev):
@@ -1547,6 +1774,13 @@ class Proxy(BaseHTTPRequestHandler):
     # ---- 路由
     def do_GET(self):
         only = self.path.split("?", 1)[0].rstrip("/")
+        if only in ("", "/console"):
+            self._send_json(200, CONSOLE_HTML.encode("utf-8"),
+                            ctype="text/html; charset=utf-8")
+            return
+        if only == "/stats":
+            self._stats()
+            return
         if only in ("/health", "/healthz"):
             self._send_json(200, json.dumps({
                 "ok": True, "upstream": UPSTREAM,
@@ -1615,6 +1849,155 @@ class Proxy(BaseHTTPRequestHandler):
                                  "supports_vision": m["supports_vision"]})
         self._send_json(200, json.dumps({"object": "list", "data": data}).encode())
 
+    def _stats(self):
+        """/stats?days=7 或 /stats?from=..&to=..（epoch 秒）。返回汇总+最近明细。"""
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.path).query)
+        try:
+            days = int((q.get("days") or ["1"])[0])
+        except Exception:
+            days = 1
+        frm = to = None
+        try:
+            if "from" in q and "to" in q:
+                frm, to = float(q["from"][0]), float(q["to"][0])
+        except Exception:
+            frm = to = None
+        if self.metrics is None:
+            self._send_json(200, b'{"error":"metrics off"}')
+            return
+        with self.metrics.lock:
+            calls = list(self.metrics.calls)
+        if frm is not None:
+            rows = [r for r in calls if frm <= r.get("t", 0) < to]
+        else:
+            cutoff = time.time() - days * 86400
+            rows = [r for r in calls if r.get("t", 0) >= cutoff]
+        # 按模型分组
+        by_model = {}
+        for r in rows:
+            m = by_model.setdefault(r.get("model") or "?", {
+                "calls": 0, "ok": 0, "prompt": 0, "completion": 0, "total": 0,
+                "reasoning": 0, "cached": 0})
+            m["calls"] += 1
+            if r.get("status") == 200:
+                m["ok"] += 1
+            for k in ("prompt", "completion", "total", "reasoning", "cached"):
+                m[k] += int(r.get(k) or 0)
+        # 按天分桶（本地时区）
+        by_day = {}
+        for r in rows:
+            d = time.strftime("%Y-%m-%d", time.localtime(r.get("t", 0)))
+            b = by_day.setdefault(d, {"calls": 0, "total": 0, "completion": 0,
+                                      "cached": 0, "tok_s_sum": 0.0, "tok_s_n": 0})
+            b["calls"] += 1
+            b["total"] += int(r.get("total") or 0)
+            b["completion"] += int(r.get("completion") or 0)
+            b["cached"] += int(r.get("cached") or 0)
+            if r.get("tok_s"):
+                b["tok_s_sum"] += r["tok_s"]
+                b["tok_s_n"] += 1
+        for b in by_day.values():
+            b["tok_s_avg"] = round(b["tok_s_sum"] / b["tok_s_n"], 1) if b["tok_s_n"] else None
+            del b["tok_s_sum"], b["tok_s_n"]
+        self._send_json(200, json.dumps({
+            "range": {"days": days, "from": frm, "to": to},
+            "total": self.metrics._sum(rows),
+            "by_model": by_model,
+            "by_day": dict(sorted(by_day.items())),
+            "recent": sorted(calls, key=lambda r: -r.get("t", 0))[:80],
+        }, ensure_ascii=False).encode("utf-8"))
+
+
+CONSOLE_HTML = """<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<title>atomcode-relay 控制台</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0f1115;--card:#171a21;--tx:#d7dce4;--mut:#8b93a3;--ok:#3fb950;--bad:#f85149;--ac:#58a6ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);
+font:14px/1.5 ui-monospace,Consolas,"Cascadia Mono",monospace;padding:18px}
+h1{font-size:17px;margin:0 0 12px}
+.tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
+.tabs button{background:var(--card);border:1px solid #2a2f3a;color:var(--mut);
+padding:6px 14px;border-radius:6px;cursor:pointer;font:inherit}
+.tabs button.on{color:var(--tx);border-color:var(--ac)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid #2a2f3a;border-radius:8px;padding:12px}
+.card .k{color:var(--mut);font-size:12px}.card .v{font-size:21px;margin-top:3px}
+table{width:100%;border-collapse:collapse;background:var(--card);border-radius:8px;overflow:hidden}
+th,td{padding:7px 10px;text-align:right;border-bottom:1px solid #22262f;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mut);font-weight:500;font-size:12px}
+tr:hover td{background:#1c2029}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+.custom{display:none;gap:8px;margin-bottom:12px}
+.custom.on{display:flex}
+input[type=datetime-local]{background:var(--card);border:1px solid #2a2f3a;
+color:var(--tx);padding:6px;border-radius:6px;font:inherit}
+.upd{color:var(--mut);font-size:12px;margin-left:8px}
+</style></head><body>
+<h1>atomcode-relay 控制台<span class="upd" id="upd"></span></h1>
+<div class="tabs">
+<button data-r="1" class="on">今天</button>
+<button data-r="7">7 天</button>
+<button data-r="30">30 天</button>
+<button data-r="0">自定义</button>
+</div>
+<div class="custom" id="custom">
+<input type="datetime-local" id="from"><span class="mut">→</span>
+<input type="datetime-local" id="to"><button id="go">查询</button>
+</div>
+<div class="cards" id="cards"></div>
+<h1>按模型</h1><div style="overflow-x:auto"><table id="tm"></table></div>
+<h1 style="margin-top:18px">按天</h1><div style="overflow-x:auto"><table id="td"></table></div>
+<h1 style="margin-top:18px">最近调用</h1><div style="overflow-x:auto"><table id="tr"></table></div>
+<script>
+let range=1, timer=null;
+const $=id=>document.getElementById(id);
+const fmt=n=>n==null?'-':(n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n);
+const time=t=>new Date(t*1000).toLocaleString('zh-CN',{hour12:false});
+async function load(){
+  let url='/stats?days='+range;
+  if(range===0){
+    const f=$('from').value,t=$('to').value;
+    if(!f||!t)return;
+    url='/stats?from='+ (new Date(f).getTime()/1000) +'&to='+ (new Date(t).getTime()/1000);
+  }
+  const r=await fetch(url);const d=await r.json();
+  const s=d.total||{};
+  const cachePct=s.prompt? (100*s.cached/s.prompt).toFixed(1)+'%':'-';
+  $('cards').innerHTML=[
+   ['调用',s.calls+' (成'+s.ok+')'],['总 tokens',fmt(s.total)],
+   ['输入',fmt(s.prompt)],['输出',fmt(s.completion)],
+   ['思考',fmt(s.reasoning)],
+   ['缓存命中',fmt(s.cached)+' / '+cachePct],
+   ['平均速度',(s.tok_s_avg!=null?s.tok_s_avg+' tok/s':'-')]
+  ].map(x=>'<div class="card"><div class="k">'+x[0]+'</div><div class="v">'+x[1]+'</div></div>').join('');
+  let h='<tr><th>模型</th><th>调用</th><th>成</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th></tr>';
+  for(const [m,v] of Object.entries(d.by_model||{}))
+    h+='<tr><td>'+m+'</td><td>'+v.calls+'</td><td class="'+(v.ok===v.calls?'ok':'bad')+'">'+v.ok+'</td><td>'+fmt(v.prompt)+'</td><td>'+fmt(v.completion)+'</td><td>'+fmt(v.reasoning)+'</td><td>'+fmt(v.cached)+'</td></tr>';
+  $('tm').innerHTML=h;
+  h='<tr><th>日期</th><th>调用</th><th>总 tokens</th><th>输出</th><th>缓存</th><th>tok/s</th></tr>';
+  for(const [k,v] of Object.entries(d.by_day||{}))
+    h+='<tr><td>'+k+'</td><td>'+v.calls+'</td><td>'+fmt(v.total)+'</td><td>'+fmt(v.completion)+'</td><td>'+fmt(v.cached)+'</td><td>'+(v.tok_s_avg??'-')+'</td></tr>';
+  $('td').innerHTML=h;
+  h='<tr><th>时间</th><th>模型</th><th>协议</th><th>状态</th><th>首字</th><th>耗时</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>tok/s</th><th>续写</th></tr>';
+  for(const c of (d.recent||[]))
+    h+='<tr><td>'+time(c.t)+'</td><td>'+(c.model||'-')+'</td><td class="mut">'+(c.proto||'-')+'</td><td class="'+(c.status===200?'ok':'bad')+'">'+c.status+'</td><td>'+(c.ttft??'-')+'s</td><td>'+c.dur+'s</td><td>'+fmt(c.prompt)+'</td><td>'+fmt(c.completion||c.est_out)+'</td><td>'+fmt(c.reasoning)+'</td><td>'+fmt(c.cached)+'</td><td>'+(c.tok_s??'-')+'</td><td>'+(c.cont||'')+'</td></tr>';
+  $('tr').innerHTML=h;
+  $('upd').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+}
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');range=+b.dataset.r;
+  $('custom').classList.toggle('on',range===0);
+  if(range!==0)load();
+});
+$('go').onclick=load;
+load();timer=setInterval(load,5000);
+</script></body></html>"""
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -1647,11 +2030,14 @@ def main():
     Proxy.store = store
     Proxy.token_floor = args.token_floor
     Proxy.drop_max = args.drop_max_tokens
+    Proxy.metrics = Metrics(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "stats.jsonl"))
 
     print("atomcode2api")
     print("  upstream : %s" % UPSTREAM)
     print("  auth     : %s (user=%s)" % (args.auth, store.user.get("username", "?")))
     print("  listen   : http://%s:%d/v1" % (args.host, args.port))
+    print("  控制台   : http://%s:%d/console" % (args.host, args.port))
     print("  预算策略 : %s / 温度缺省 %s" % (
         "删掉 max_tokens(极端)" if Proxy.drop_max else "抬到 %d" % args.token_floor,
         "不注入" if not DEFAULT_TEMPERATURE else DEFAULT_TEMPERATURE))

@@ -45,7 +45,7 @@ GET /v1/models                    ──▶ AI Hub 目录 ∪ CodingPlan 名单�
 
 同类项目（AtomCode2api 等）大多只做**协议转换**。这个项目在此之上解决的是
 **"接上真实 agent 客户端后流会不会死"**——全部机制源自对官方 Rust 客户端
-重试/超时行为的实测对齐，并有 20 个自动化回归场景背书。
+重试/超时行为的实测对齐，并有 29 个自动化回归场景背书。
 
 | 能力 | atomcode-relay | 一般同类反代 |
 |---|---|---|
@@ -60,7 +60,8 @@ GET /v1/models                    ──▶ AI Hub 目录 ∪ CodingPlan 名单�
 | 思考模型温度缺省注入（防贪心复读） | ✅ 客户端传了绝不动 | ❌ |
 | 输出预算治理（抬到 32768，防思考吃光正文） | ✅ | ❌ |
 | 上游 200 伪装错误（"负载过高"/额度不足等）→ 改判 503 | ✅ | ✅ |
-| 自动化回归（假上游剧本 ×20 场景） | ✅ 随包 | ❌ |
+| **内置网页控制台**（用量/token/TTFT/tok·s⁻¹/缓存命中，今天/7/30/自定义） | ✅ | ❌ |
+| 自动化回归（假上游剧本 ×29 场景） | ✅ 随包 | ❌ |
 
 ## 多看到一个池子：A 池 + B 池目录并集
 
@@ -96,6 +97,15 @@ AtomCode 账号背后其实有**两组模型、两套额度**，上游 `/v1/mode
 python atomcode2api.py --port 8787
 ```
 
+启动后浏览器打开 **http://127.0.0.1:8787/console** —— 内置网页控制台：每次调用的
+时间、模型、协议、状态、首字耗时（TTFT）、总耗时、输入/输出/思考 token、
+**缓存命中 token**、生成速度（tok/s）、续写轮数；顶部可切 今天 / 7 天 / 30 天 /
+自定义区间，汇总 token 总量与平均速度，并按模型、按天分组。数据落盘为
+`stats.jsonl`（JSONL，可二次分析），页面 5 秒自动刷新，零外部依赖。
+
+缓存命中取上游 usage 的 `prompt_tokens_details.cached_tokens`（实测上游确实回传：
+重复前缀命中 320/372）；上游没给时显示 0。
+
 | 客户端 | 配置 |
 |---|---|
 | OpenAI SDK / 任意 OpenAI 兼容 | `base_url=http://127.0.0.1:8787/v1`，key 任意 |
@@ -121,7 +131,8 @@ python atomcode2api.py --port 8787
 ```bash
 python tests/test_guard.py        # 熔断/温度 单测
 python tests/test_passthrough.py  # 透传回归 ×8（重开/收尾/503/真流式/熔断）
-python tests/test_continue.py     # 续写回归 ×12（挂死/接缝/耗尽/思考回灌）
+python tests/test_continue.py     # 续写回归 ×11（挂死/接缝/耗尽/思考回灌）
+python tests/test_ledger.py       # 台账/控制台 ×10（usage/缓存/聚合/页面）
 ```
 
 ## 已知限制（诚实清单）

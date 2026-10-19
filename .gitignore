@@ -7,6 +7,8 @@ __pycache__/
 proxy.log
 _cont.log
 _pt.log
+_ledger.log
+stats.jsonl
 *.bak.py
 
 # 凭证（绝不该进仓库，双保险）
