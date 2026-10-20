@@ -105,6 +105,24 @@ MASKED_ERRORS = ("请求负载过高", "参数错误", "模型不存在", "rate 
                   # 0/200、exhausted=false，说明窗口之外还有一道按模型的闸。
                   "用量窗口内已达上限", "窗口内已达上限")
 
+# 额度墙话术（区别于"请求负载过高"那类瞬时过载）：命中即给台账打 wall 标记，
+# 控制台据此显示「本窗口已撞墙」与「历史撞墙点」，用于反推墙的阈值。
+QUOTA_WALL = ("用量窗口内已达上限", "窗口内已达上限", "额度已不足", "额度不足")
+
+
+def _wall_phrase(raw):
+    """从 200 伪装失败的响应体里抠出命中的**额度墙**话术；没有则 None。"""
+    try:
+        txt = raw.decode("utf-8", "replace") if isinstance(raw, bytes) \
+            else json.dumps(raw, ensure_ascii=False)
+    except Exception:
+        return None
+    for p in QUOTA_WALL:
+        if p in txt:
+            return p
+    return None
+
+
 HOP = {"host", "connection", "content-length", "transfer-encoding", "authorization",
        "x-api-key", "accept-encoding", "keep-alive", "proxy-authorization"}
 
@@ -673,8 +691,9 @@ class Proxy(BaseHTTPRequestHandler):
     _client_gone = False
     metrics = None          # main() 里挂 Metrics 实例
 
-    def _tally(self, ctx, status, usage=None, chars=0, continues=0):
-        """记一笔调用台账。ctx={t0,t1,fb,model,proto}；绝不抛错影响主流程。"""
+    def _tally(self, ctx, status, usage=None, chars=0, continues=0, wall=None):
+        """记一笔调用台账。ctx={t0,t1,fb,model,proto}；绝不抛错影响主流程。
+        wall=命中的额度墙话术（None 表示没撞墙）。"""
         try:
             if self.metrics is None or not ctx:
                 return
@@ -695,7 +714,7 @@ class Proxy(BaseHTTPRequestHandler):
                 "prompt": u.get("prompt", 0), "completion": comp,
                 "total": u.get("total", 0), "reasoning": u.get("reasoning", 0),
                 "cached": u.get("cached", 0), "est_out": est,
-                "cont": continues, "tok_s": tok_s})
+                "cont": continues, "tok_s": tok_s, "wall": wall})
         except Exception:
             pass
 
@@ -802,13 +821,14 @@ class Proxy(BaseHTTPRequestHandler):
                 lines = self._passthrough_sse(resp, reopen, ctx)
                 usage, chars = _usage_from_lines(lines)
                 ctx["t1"] = time.time()
-                self._tally(ctx, ctx.get("status", 200), usage, chars)
+                self._tally(ctx, ctx.get("status", 200), usage, chars,
+                            wall=ctx.get("wall"))
                 return
             raw = resp.read()
             ctx["t1"] = time.time()
             if status == 200 and _masked_error(raw):
                 self._send_json(503, raw)   # 上游拿 200 伪装的失败
-                self._tally(ctx, 503)
+                self._tally(ctx, 503, wall=_wall_phrase(raw))
                 return
             self.send_response(status)
             if ctype:
@@ -1062,6 +1082,7 @@ class Proxy(BaseHTTPRequestHandler):
             self._send_json(503, verdict)
             if ctx is not None:
                 ctx["status"] = 503
+                ctx["wall"] = _wall_phrase(verdict)
             return opened, "ok", saw_finish
 
         open_stream()
@@ -1159,7 +1180,8 @@ class Proxy(BaseHTTPRequestHandler):
                 ctx["t1"] = time.time()
                 self._responses_plain(raw, chat.get("model"), resp_id)
                 self._tally(ctx, 503 if _masked_error(raw) else 200,
-                            _usage_from_raw(raw))
+                            _usage_from_raw(raw),
+                            wall=_wall_phrase(raw) if _masked_error(raw) else None)
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
@@ -1210,7 +1232,7 @@ class Proxy(BaseHTTPRequestHandler):
             self._send_json(503, json.dumps(first).encode())
             if ctx is not None:
                 ctx["t1"] = time.time()
-                self._tally(ctx, 503)
+                self._tally(ctx, 503, wall=_wall_phrase(json.dumps(first, ensure_ascii=False)))
             return
 
         def chained():
@@ -1849,6 +1871,35 @@ class Proxy(BaseHTTPRequestHandler):
                                  "supports_vision": m["supports_vision"]})
         self._send_json(200, json.dumps({"object": "list", "data": data}).encode())
 
+    _quota_box = {"at": 0.0, "data": None}   # 控制面快照缓存（20s）
+
+    def _quota_snapshot(self):
+        """读控制面 status-v2：可见窗口计数 + reset_at。20s 缓存，失败降级。"""
+        box = Proxy._quota_box
+        if box["data"] is not None and time.time() - box["at"] < 20:
+            return box["data"]
+        try:
+            req = urllib.request.Request(
+                CODINGPLAN_API + "/status-v2?plan_type=Lite",
+                headers={"Authorization": "Bearer " + self.store.get(),
+                         "User-Agent": NEUTRAL_UA})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                d = json.loads(resp.read().decode())
+            cu = d.get("current_usage") or {}
+            box["data"] = {"window_used": cu.get("window_tokens_used"),
+                           "window_limit": cu.get("window_token_limit"),
+                           "exhausted": d.get("window_quota_exhausted"),
+                           "reset_at": cu.get("reset_at"),
+                           "plan_expires_at": d.get("expires_at"),
+                           "note": "可见计数器只记官方签名通道，反代不进这本账；"
+                                   "但存在按模型的配额墙（见撞墙标记）"}
+            box["at"] = time.time()
+        except Exception as exc:
+            if box["data"] is None:
+                box["data"] = {"error": str(exc)}
+            box["at"] = time.time()
+        return box["data"]
+
     def _stats(self):
         """/stats?days=7 或 /stats?from=..&to=..（epoch 秒）。返回汇总+最近明细。"""
         from urllib.parse import urlparse, parse_qs
@@ -1900,12 +1951,77 @@ class Proxy(BaseHTTPRequestHandler):
         for b in by_day.values():
             b["tok_s_avg"] = round(b["tok_s_sum"] / b["tok_s_n"], 1) if b["tok_s_n"] else None
             del b["tok_s_sum"], b["tok_s_n"]
+
+        # ---- 额度面板：A 池窗口自记账 + 撞墙史 + B 池本月账 ----
+        qs = self._quota_snapshot() if self.store else {}
+        reset_at = None
+        try:
+            reset_at = qs.get("reset_at")  # ISO 字符串
+        except Exception:
+            pass
+        # 窗口起点 = reset_at - 5h（读不到就取最近 5h）
+        win_start = time.time() - 5 * 3600
+        if reset_at:
+            try:
+                from datetime import datetime
+                rt = datetime.fromisoformat(reset_at).timestamp()
+                win_start = rt - 5 * 3600
+            except Exception:
+                pass
+        win_rows = [r for r in calls if r.get("t", 0) >= win_start]
+        win_by_model = {}
+        for r in win_rows:
+            m = win_by_model.setdefault(r.get("model") or "?", {
+                "calls": 0, "tokens": 0, "walls": 0})
+            m["calls"] += 1
+            m["tokens"] += int(r.get("total") or 0)
+            if r.get("wall"):
+                m["walls"] += 1
+        # 撞墙史（全量）：每模型最近一次撞墙 + 30 天内次数
+        wall_hist = {}
+        cutoff30 = time.time() - 30 * 86400
+        for r in calls:
+            if not r.get("wall"):
+                continue
+            m = wall_hist.setdefault(r.get("model") or "?",
+                                     {"last": 0, "phrase": r["wall"], "n30": 0,
+                                      "tokens_before_30d": 0})
+            if r.get("t", 0) > m["last"]:
+                m["last"] = r.get("t", 0)
+                m["phrase"] = r["wall"]
+            if r.get("t", 0) >= cutoff30:
+                m["n30"] += 1
+        # B 池本月账（模型名带 "/" 即 AI Hub 名）；本月起点 = 1 号零点
+        now_lt = time.localtime()
+        month_start = time.mktime((now_lt.tm_year, now_lt.tm_mon, 1,
+                                   0, 0, 0, 0, 0, -1))
+        bpool = {}
+        for r in calls:
+            mo = r.get("model") or ""
+            if "/" not in mo:
+                continue
+            m = bpool.setdefault(mo, {"calls": 0, "ok": 0, "tokens": 0,
+                                      "walls": 0, "last": 0})
+            m["calls"] += 1
+            if r.get("status") == 200:
+                m["ok"] += 1
+            m["tokens"] += int(r.get("total") or 0)
+            if r.get("wall"):
+                m["walls"] += 1
+            m["last"] = max(m["last"], r.get("t", 0))
         self._send_json(200, json.dumps({
             "range": {"days": days, "from": frm, "to": to},
             "total": self.metrics._sum(rows),
             "by_model": by_model,
             "by_day": dict(sorted(by_day.items())),
             "recent": sorted(calls, key=lambda r: -r.get("t", 0))[:80],
+            "quota": {
+                "control_plane": qs,
+                "window": {"start": win_start, "by_model": win_by_model},
+                "walls": wall_hist,
+                "bpool_month": bpool,
+                "bpool_month_start": month_start,
+            },
         }, ensure_ascii=False).encode("utf-8"))
 
 
@@ -1949,6 +2065,11 @@ color:var(--tx);padding:6px;border-radius:6px;font:inherit}
 <input type="datetime-local" id="to"><button id="go">查询</button>
 </div>
 <div class="cards" id="cards"></div>
+<h1 style="margin-top:18px">A 池额度（CodingPlan）<span class="mut" id="qnote" style="font-size:11px"></span></h1>
+<div class="cards" id="qcards"></div>
+<div style="overflow-x:auto"><table id="tw"></table></div>
+<h1 style="margin-top:18px">B 池本月用量（AI Hub）</h1>
+<div style="overflow-x:auto"><table id="tb"></table></div>
 <h1>按模型</h1><div style="overflow-x:auto"><table id="tm"></table></div>
 <h1 style="margin-top:18px">按天</h1><div style="overflow-x:auto"><table id="td"></table></div>
 <h1 style="margin-top:18px">最近调用</h1><div style="overflow-x:auto"><table id="tr"></table></div>
@@ -1974,6 +2095,37 @@ async function load(){
    ['缓存命中',fmt(s.cached)+' / '+cachePct],
    ['平均速度',(s.tok_s_avg!=null?s.tok_s_avg+' tok/s':'-')]
   ].map(x=>'<div class="card"><div class="k">'+x[0]+'</div><div class="v">'+x[1]+'</div></div>').join('');
+  // ---- A 池额度面板 ----
+  const q=d.quota||{}, cp=q.control_plane||{};
+  if(cp.window_limit!=null){
+    $('qnote').textContent='（重置 '+new Date(cp.reset_at).toLocaleTimeString('zh-CN',{hour12:false})+'，套餐至 '+(cp.plan_expires_at||'?')+'）';
+    const mm=Math.max(0,Math.round((new Date(cp.reset_at)-Date.now())/60000));
+    $('qcards').innerHTML=[
+     ['可见窗口计数',cp.window_used+' / '+cp.window_limit],
+     ['重置倒计时',(mm>=60?Math.floor(mm/60)+'h'+(mm%60)+'m':mm+'m')],
+     ['状态',cp.exhausted?'<span class="bad">官方通道已满</span>':'<span class="ok">官方通道正常</span>']
+    ].map(x=>'<div class="card"><div class="k">'+x[0]+'</div><div class="v">'+x[1]+'</div></div>').join('');
+  } else { $('qcards').innerHTML='<div class="card"><div class="k">控制面</div><div class="v" style="font-size:13px">'+(cp.error||'不可读')+'</div></div>'; }
+  // 窗口内自记账 + 撞墙史（按模型）
+  const wm=(q.window&&q.window.by_model)||{}, wh=q.walls||{};
+  let names=new Set([...Object.keys(wm),...Object.keys(wh)]);
+  let hw='<tr><th>模型</th><th>本窗口(5h)调用</th><th>本窗口 tokens</th><th>本窗口撞墙</th><th>30天撞墙</th><th>最近撞墙</th><th>墙话术</th></tr>';
+  if(!names.size)hw+='<tr><td colspan=7 class="mut">暂无数据</td></tr>';
+  for(const m of [...names].sort()){
+    const w=wm[m]||{}, h=wh[m]||{};
+    hw+='<tr><td>'+m+'</td><td>'+(w.calls||0)+'</td><td>'+fmt(w.tokens||0)+'</td><td class="'+((w.walls||0)?'bad':'ok')+'">'+(w.walls||0)+'</td><td>'+(h.n30||0)+'</td><td>'+(h.last?time(h.last):'-')+'</td><td class="mut">'+(h.phrase||'-')+'</td></tr>';
+  }
+  $('tw').innerHTML=hw;
+  // ---- B 池本月 ----
+  const bp=q.bpool_month||{};
+  let bk=Object.keys(bp).sort();
+  let hb='<tr><th>模型</th><th>本月调用</th><th>成功</th><th>本月 tokens</th><th>本月撞墙</th><th>最近调用</th></tr>';
+  if(!bk.length)hb+='<tr><td colspan=6 class="mut">本月无 B 池调用（或无 "/" 模型名）</td></tr>';
+  for(const m of bk){
+    const v=bp[m];
+    hb+='<tr><td>'+m+'</td><td>'+v.calls+'</td><td class="'+(v.ok===v.calls?'ok':'bad')+'">'+v.ok+'</td><td>'+fmt(v.tokens)+'</td><td class="'+(v.walls?'bad':'ok')+'">'+v.walls+'</td><td>'+(v.last?time(v.last):'-')+'</td></tr>';
+  }
+  $('tb').innerHTML=hb;
   let h='<tr><th>模型</th><th>调用</th><th>成</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th></tr>';
   for(const [m,v] of Object.entries(d.by_model||{}))
     h+='<tr><td>'+m+'</td><td>'+v.calls+'</td><td class="'+(v.ok===v.calls?'ok':'bad')+'">'+v.ok+'</td><td>'+fmt(v.prompt)+'</td><td>'+fmt(v.completion)+'</td><td>'+fmt(v.reasoning)+'</td><td>'+fmt(v.cached)+'</td></tr>';
