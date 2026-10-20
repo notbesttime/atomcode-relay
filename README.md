@@ -110,6 +110,11 @@ python atomcode2api.py --port 8787
 自定义区间，汇总 token 总量与平均速度，并按模型、按天分组。数据落盘为
 `stats.jsonl`（JSONL，可二次分析），页面 5 秒自动刷新，零外部依赖。
 
+**台账文件是唯一事实源**：每条调用先追加进 `stats.jsonl`，控制台读取时会检查文件
+mtime，被其它进程（含重启前的自己）动过就重新载入 —— 所以**重启代理不丢历史**，
+多实例也互相可见。文件只追加不清理（按日常用量每天几十 KB 量级），路径可用
+`ATOMCODE_CALLLOG` 改到别处；删掉它等于清零，建议先复制留档。
+
 缓存命中取上游 usage 的 `prompt_tokens_details.cached_tokens`（实测上游确实回传：
 重复前缀命中 320/372）；上游没给时显示 0。
 
@@ -123,6 +128,12 @@ python atomcode2api.py --port 8787
   某模型撞墙时看它本窗口已用了多少 tokens/发数，多攒几次就能反推墙高；
 - **B 池（AI Hub）本月账**：按 `/` 前缀模型名分组，本月调用/成功/tokens/撞墙，
   月度额度耗尽（"每月token额度已不足"）直接显示。
+
+台账每行是一个 JSON 对象，字段：`t`(epoch 秒)、`model`、`proto`(chat/responses/
+anthropic)、`status`、`dur`(总耗时秒)、`ttft`(首字秒)、`prompt`/`completion`/
+`total`/`reasoning`/`cached`(token)、`est_out`(上游没回 usage 时按字符估的输出)、
+`cont`(续写轮数)、`tok_s`(生成速度)、`wall`(非空即撞额度墙，值为上游话术)。
+可直接 `pandas.read_json(path, lines=True)` 做二次分析。
 
 | 客户端 | 配置 |
 |---|---|
@@ -143,6 +154,17 @@ python atomcode2api.py --port 8787
 | `ATOMCODE_FIRST_EVENT` | 60 | 首可见事件预算秒（超时安全重开） |
 | `ATOMCODE_UPSTREAM` | api-ai.gitcode.com/v1 | 上游地址 |
 | `ATOMCODE_UA` | curl/8.6.0 | 中性 UA（上游按 UA 决定是否强制签名） |
+| `ATOMCODE_CALLLOG` | 脚本同目录 `stats.jsonl` | 调用台账路径（换盘/留档/测试隔离用） |
+
+## 版本沿革
+
+| 版本 | 内容 |
+|---|---|
+| v1.0 | 反代核心：透传 SSE（死流透明重开 / 补 [DONE] / 200 伪装错误改判 503）、Responses 桥、心跳续命、挂死与写满预算自动续写（含思考回灌）、复读熔断、温度缺省、跨轮思考 |
+| v1.1 | **内置网页控制台** `/console` + 调用台账 `stats.jsonl`（TTFT / 耗时 / token / tok·s⁻¹ / **缓存命中** / 续写轮数；今天·7天·30天·自定义；按模型按天） |
+| v1.1.1 | 启动自动打开控制台；修正 A 池额度结论（可见计数器不记反代，但存在看不见的按模型配额墙） |
+| v1.2 | **额度面板**：撞墙话术入台账（`wall`）、本窗口(5h)自记账、30 天撞墙史、B 池本月账、控制面窗口计数与重置倒计时 |
+| v1.2.1 | **重启不丢历史**（台账文件为唯一事实源，按 mtime 自动重载）；台账路径可 `ATOMCODE_CALLLOG` 隔离；修 `_wall_phrase` 漏解 `\uXXXX` 导致真实流量撞墙标记一直为空 |
 
 ## 测试
 
@@ -150,7 +172,7 @@ python atomcode2api.py --port 8787
 python tests/test_guard.py        # 熔断/温度 单测
 python tests/test_passthrough.py  # 透传回归 ×8（重开/收尾/503/真流式/熔断）
 python tests/test_continue.py     # 续写回归 ×11（挂死/接缝/耗尽/思考回灌）
-python tests/test_ledger.py       # 台账/控制台 ×10（usage/缓存/聚合/页面）
+python tests/test_ledger.py       # 台账/控制台 ×20（usage/缓存/撞墙/重启不丢历史/多实例累计）
 ```
 
 ## 已知限制（诚实清单）
