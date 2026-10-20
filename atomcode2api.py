@@ -111,12 +111,22 @@ QUOTA_WALL = ("用量窗口内已达上限", "窗口内已达上限", "额度已
 
 
 def _wall_phrase(raw):
-    """从 200 伪装失败的响应体里抠出命中的**额度墙**话术；没有则 None。"""
-    try:
-        txt = raw.decode("utf-8", "replace") if isinstance(raw, bytes) \
-            else json.dumps(raw, ensure_ascii=False)
-    except Exception:
-        return None
+    """从 200 伪装失败的响应体里抠出命中的**额度墙**话术；没有则 None。
+
+    上游 JSON 默认 ensure_ascii，中文全是 \\uXXXX 转义，直接对原始字节做子串
+    匹配永远命中不了 —— 必须先 json.loads 解回真中文再找。
+    """
+    if isinstance(raw, bytes):
+        try:
+            txt = json.dumps(json.loads(raw.decode("utf-8", "replace")),
+                             ensure_ascii=False)
+        except Exception:
+            txt = raw.decode("utf-8", "replace")
+    else:
+        try:
+            txt = json.dumps(raw, ensure_ascii=False)
+        except Exception:
+            return None
     for p in QUOTA_WALL:
         if p in txt:
             return p
@@ -140,6 +150,7 @@ class Metrics:
         self.path = path
         self.calls = []
         self.lock = threading.Lock()
+        self.mtime = None
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as fh:
@@ -150,6 +161,7 @@ class Metrics:
                             pass
                 if len(self.calls) > 20000:
                     self.calls = self.calls[-20000:]
+                self.mtime = os.path.getmtime(path)
         except Exception:
             self.calls = []
 
@@ -161,8 +173,32 @@ class Metrics:
             try:
                 with open(self.path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                self.mtime = os.path.getmtime(self.path)
             except Exception:
                 pass
+
+    def maybe_reload(self):
+        """台账文件被别的进程/新会话动过时重新读入。文件是唯一事实源：
+        重启不丢历史、多实例互相可见（mtime 没变就是零成本）。"""
+        try:
+            m = os.path.getmtime(self.path)
+        except OSError:
+            return
+        if getattr(self, "mtime", None) == m:
+            return
+        try:
+            rows = []
+            with open(self.path, "r", encoding="utf-8") as fh:
+                for ln in fh:
+                    try:
+                        rows.append(json.loads(ln))
+                    except Exception:
+                        pass
+        except Exception:
+            return
+        with self.lock:
+            self.calls = rows[-20000:]
+            self.mtime = m
 
     @staticmethod
     def _sum(rows):
@@ -1917,6 +1953,7 @@ class Proxy(BaseHTTPRequestHandler):
         if self.metrics is None:
             self._send_json(200, b'{"error":"metrics off"}')
             return
+        self.metrics.maybe_reload()   # 台账文件是唯一事实源：重启/多实例都不丢历史
         with self.metrics.lock:
             calls = list(self.metrics.calls)
         if frm is not None:
@@ -2182,8 +2219,9 @@ def main():
     Proxy.store = store
     Proxy.token_floor = args.token_floor
     Proxy.drop_max = args.drop_max_tokens
-    Proxy.metrics = Metrics(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "stats.jsonl"))
+    log_path = os.environ.get("ATOMCODE_CALLLOG") \
+        or os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.jsonl")
+    Proxy.metrics = Metrics(log_path)
 
     print("atomcode2api")
     print("  upstream : %s" % UPSTREAM)
